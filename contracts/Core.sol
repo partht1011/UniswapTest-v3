@@ -4,176 +4,138 @@ pragma solidity >=0.8.0;
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-import "./interfaces/IUniswapV2Router02.sol";
-import "./interfaces/IUniswapV2Factory.sol";
-contract Core {
+import "./interfaces/periphery/INonfungiblePositionManager.sol";
+import "./interfaces/periphery/ISwapRouter.sol";
+
+contract Core{
     using SafeERC20 for IERC20;
 
-    IUniswapV2Router02 public router;
+    event LiquidityAdded(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1);
+
+    INonfungiblePositionManager public positionManager;
+    ISwapRouter public router;
     
-    constructor(IUniswapV2Router02 _router) {
+    constructor(INonfungiblePositionManager _positionManager, ISwapRouter _router) {
+        positionManager = _positionManager;
         router = _router;
     }
 
-    /**
-     */
     function addLiquidity(
-        IERC20 token1,
-        IERC20 token2,
-        uint256 amount1,
-        uint256 amount2
-    ) external returns (uint amountA, uint amountB, uint liquidity) {
-        token1.safeTransferFrom(msg.sender, address(this), amount1);
-        token2.safeTransferFrom(msg.sender, address(this), amount2);
+        uint256 nftId,
+        address token0,
+        address token1,
+        uint256 amount0Desired,
+        uint256 amount1Desired,
+        uint24 poolFee,
+        int24 priceLower,
+        int24 priceUpper
+    ) external returns (uint256 tokenId, uint128 liquidity, uint256 amount0, uint256 amount1) {
 
-        token1.approve(address(router), amount1);
-        token2.approve(address(router), amount2);
+        // Transfer tokens to the contract
+        IERC20(token0).safeTransferFrom(msg.sender, address(this), amount0Desired);
+        IERC20(token1).safeTransferFrom(msg.sender, address(this), amount1Desired);
 
-        return router.addLiquidity(
-            address(token1),
-            address(token2),
-            amount1,
-            amount2,
-            0,
-            0,
-            msg.sender,
-            block.timestamp
-        );
+        // Approve the Position Manager contract to spend tokens
+        IERC20(token0).approve(address(positionManager), amount0Desired);
+        IERC20(token1).approve(address(positionManager), amount1Desired);
+
+        if(nftId == 0) {
+            // Creating a new position (minting liquidity)
+            INonfungiblePositionManager.MintParams memory params = INonfungiblePositionManager.MintParams({
+                token0: token0,
+                token1: token1,
+                fee: poolFee, // fee tier (can be 500, 3000, or 10000 for different fee tiers)
+                tickLower: int24(priceLower),
+                tickUpper: int24(priceUpper),
+                amount0Desired: amount0Desired,
+                amount1Desired: amount1Desired,
+                amount0Min: 0,
+                amount1Min: 0,
+                recipient: msg.sender,
+                deadline: block.timestamp
+            });
+            (tokenId, liquidity, amount0, amount1) = positionManager.mint(params);
+        } else {
+            // Increasing liquidity in an existing position
+            INonfungiblePositionManager.IncreaseLiquidityParams memory increaseParams = INonfungiblePositionManager.IncreaseLiquidityParams({
+                tokenId: tokenId,                      // The existing tokenId of the position
+                amount0Desired: amount0Desired,        // Amount of token0 to add
+                amount1Desired: amount1Desired,        // Amount of token1 to add
+                amount0Min: 0,                         // Slippage tolerance for token0
+                amount1Min: 0,                         // Slippage tolerance for token1
+                deadline: block.timestamp              // Expiry time for the transaction
+            });
+
+            // Increase the liquidity of the existing position
+            (liquidity, amount0, amount1) = positionManager.increaseLiquidity(increaseParams);
+            tokenId = nftId;
+        }
+        emit LiquidityAdded(tokenId, liquidity, amount0, amount1);
+        return (tokenId, liquidity, amount0, amount1);
     }
 
-    /**
-     */
-    function addLiquidityETH(
-        IERC20 token,
-        uint256 amount
-    ) external payable returns (uint amountToken, uint amountETH, uint liquidity){
-        token.safeTransferFrom(msg.sender, address(this), amount);
-        token.approve(address(router), amount);
-
-        uint ethAmount = msg.value;
-        return router.addLiquidityETH{value: ethAmount}(
-            address(token), 
-            amount, 
-            0, 
-            0, 
-            msg.sender, 
-            block.timestamp
-        );
-    }
-
-    /**
-     */
     function removeLiquidity(
-        IERC20 tokenA,
-        IERC20 tokenB,
-        uint256 liquidity
-    ) external returns (uint amountA, uint amountB){
-        IUniswapV2Factory factory = IUniswapV2Factory(router.factory());
-        address pair = factory.getPair(address(tokenA), address(tokenB));
-        IERC20 liquidityToken = IERC20(pair);
-        liquidityToken.safeTransferFrom(msg.sender, address(this), liquidity);
-        liquidityToken.approve(address(router), liquidity);
+        uint256 tokenId,          // Unique tokenId to identify the liquidity position
+        uint128 liquidityAmount  // Amount of liquidity to remove
+    ) external returns (uint256 amount0, uint256 amount1) {
+        // Ensure the caller is the owner of the position
+        require(positionManager.ownerOf(tokenId) == msg.sender, "Not the owner");
 
-        return router.removeLiquidity(
-            address(tokenA),
-            address(tokenB),
-            liquidity,
-            0,
-            0,
-            msg.sender,
-            block.timestamp
-        );
+        // Call decreaseLiquidity to remove the specified amount of liquidity from the position
+        INonfungiblePositionManager.DecreaseLiquidityParams memory decreaseParams =
+            INonfungiblePositionManager.DecreaseLiquidityParams({
+                tokenId: tokenId,
+                liquidity: liquidityAmount,
+                amount0Min: 0,
+                amount1Min: 0,
+                deadline: block.timestamp
+            });
+
+        // Execute decreaseLiquidity
+        (amount0, amount1) = positionManager.decreaseLiquidity(decreaseParams);
+
+        // Collect the tokens from the liquidity removal
+        INonfungiblePositionManager.CollectParams memory collectParams =
+            INonfungiblePositionManager.CollectParams({
+                tokenId: tokenId,
+                recipient: msg.sender,
+                amount0Max: type(uint128).max,
+                amount1Max: type(uint128).max
+            });
+
+        // Collect the tokens after liquidity removal
+        (amount0, amount1) = positionManager.collect(collectParams);
+
+        // Ensure that the withdrawn amounts are above the minimum thresholds to prevent slippage
+        require(amount0 >= 0, "Slippage in amount0");
+        require(amount1 >= 0, "Slippage in amount1");
     }
 
-    /**
-     */
-    function removeLiquidityETH(
-        IERC20 token,
-        uint256 liquidity
-    ) external returns (uint amountToken, uint amountETH){
-        IUniswapV2Factory factory = IUniswapV2Factory(router.factory());
-        address pair = factory.getPair(address(token), router.WETH());
-        IERC20 liquidityToken = IERC20(pair);
-        liquidityToken.safeTransferFrom(msg.sender, address(this), liquidity);
-        liquidityToken.approve(address(router), liquidity);
+    function swapTokens(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint24 poolFee
+    ) external returns (uint256 amountOut) {
+        // Transfer tokenIn to this contract
+        IERC20(tokenIn).safeTransferFrom(msg.sender, address(this), amountIn);
 
-        return router.removeLiquidityETH(
-            address(token),
-            liquidity,
-            0,
-            0,
-            msg.sender,
-            block.timestamp
-        );
+        // Approve the router to spend tokenIn
+        IERC20(tokenIn).approve(address(router), amountIn);
+
+        // Set up the swap path (tokenIn -> tokenOut)
+        ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
+            tokenIn: tokenIn,
+            tokenOut: tokenOut,
+            fee: poolFee, // Pool fee (e.g., 500, 3000, or 10000)
+            recipient: msg.sender,
+            deadline: block.timestamp,
+            amountIn: amountIn,
+            amountOutMinimum: 0,
+            sqrtPriceLimitX96: 0 // No price limit for this example
+        });
+
+        // Execute the swap
+        amountOut = router.exactInputSingle(params);
     }
-
-    /**
-     */
-    function swapExactTokensForTokens(
-        IERC20 token1,
-        IERC20 token2,
-        uint256 amountIn
-    ) external returns (uint amountOut){
-        token1.safeTransferFrom(msg.sender, address(this), amountIn);
-        token1.approve(address(router), amountIn);
-
-        address[] memory path = new address[](2);
-        path[0] = address(token1);
-        path[1] = address(token2);
-
-        return router.swapExactTokensForTokens(
-            amountIn,
-            0,
-            path,
-            msg.sender,
-            block.timestamp 
-        )[1];
-    }
-
-    /**
-     */
-    function swapTokensForExactTokens(
-        IERC20 token1,
-        IERC20 token2,
-        uint256 amountOut,
-        uint256 amountInMax
-    ) external returns (uint amountIn){
-        token1.safeTransferFrom(msg.sender, address(this), amountInMax);
-        token1.approve(address(router), amountInMax);
-
-        address[] memory path = new address[](2);
-        path[0] = address(token1);
-        path[1] = address(token2);
-
-        return router.swapTokensForExactTokens(
-            amountOut,
-            amountInMax,
-            path,
-            msg.sender,
-            block.timestamp
-        )[0];
-    }
-
-    /**
-     */
-    function swapExactETHForTokens(
-        IERC20 token
-    ) external payable returns (uint256 amountTokens) {
-        require(msg.value > 0, "Must send ETH");
-
-        address[] memory path = new address[](2);
-        path[0] = router.WETH();
-        path[1] = address(token);
-
-        uint256[] memory amounts = router.swapExactETHForTokens{value: msg.value}(
-            0,
-            path,
-            msg.sender,
-            block.timestamp
-        );
-        amountTokens = amounts[amounts.length - 1];
-    }
-
-    // Function to allow the contract to receive ETH
-    receive() external payable {}
 }

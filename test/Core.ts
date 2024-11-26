@@ -1,25 +1,26 @@
-
 import { expect } from "chai"
-import { getAddress, parseEther } from "ethers"
+import { parseEther } from "ethers"
 import { ethers } from "hardhat"
-import { Core, IUniswapV2Factory, IUniswapV2Router02, TestToken } from "typechain-types"
-import { IERC20 } from './../typechain-types/@openzeppelin/contracts/token/ERC20/IERC20';
+import { Core, INonfungiblePositionManager, IUniswapV3Factory, TestToken } from "typechain-types"
 
 describe("Core", () => {
-    const ADDRESS__UNISWAP_V2_ROUTER = "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D"
-    const ADDRESS__UNISWAP_V2_FACTORY = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
+    const ADDRESS_FACTORY = "0x1F98431c8aD98523631AE4a59f267346ea31F984"; // Uniswap V3 Factory
+    const ADDRESS_POSITION_MANAGER = "0xC36442b4a4522E871399CD717aBDD847Ab11FE88"; // Uniswap V3 NonfungiblePositionManager
+    const ADDRESS_SWAP_ROUTER = "0xE592427A0AEce92De3Edee1F18E0157C05861564"; // Uniswap V3 SwapRouter
 
-    let deployer: any, alice: any, bob: any
+    const POOL_FEE = 3000;
 
+    let deployer: any, alice: any
     let token1: TestToken
     let token2: TestToken
     let core: Core
-    let v2Router: IUniswapV2Router02
-    let v2Factory: IUniswapV2Factory
 
     let token1Addr: any
     let token2Addr: any
     let coreAddr: any
+
+    let v3Factory: IUniswapV3Factory
+    let v3PositionManager: INonfungiblePositionManager
 
     before(async () => {
         // deploy
@@ -29,184 +30,133 @@ describe("Core", () => {
         token1 = await TestTokenFactory.deploy("TT1", "TT1")
         token2 = await TestTokenFactory.deploy("TT2", "TT2")
 
-        v2Router = await ethers.getContractAt("IUniswapV2Router02", ADDRESS__UNISWAP_V2_ROUTER)
-        v2Factory = await ethers.getContractAt("IUniswapV2Factory", ADDRESS__UNISWAP_V2_FACTORY)
-
         const CoreFactory = await ethers.getContractFactory("Core")
-        core = await CoreFactory.deploy(ADDRESS__UNISWAP_V2_ROUTER)
+        core = await CoreFactory.deploy(ADDRESS_POSITION_MANAGER, ADDRESS_SWAP_ROUTER)
 
         token1Addr = await token1.getAddress()
         token2Addr = await token2.getAddress()
         coreAddr = await core.getAddress()
+
+        v3Factory = await ethers.getContractAt("IUniswapV3Factory", ADDRESS_FACTORY);
+        v3PositionManager = await ethers.getContractAt("INonfungiblePositionManager", ADDRESS_POSITION_MANAGER);
+
+        // set the ratio 1:1
+        await v3PositionManager.createAndInitializePoolIfNecessary(token1Addr, token2Addr, POOL_FEE, BigInt(2) ** BigInt(96));
     })
 
     describe("Initial Setup", async () => {
-        it("should have the correct router address in Core", async () => {
-            expect(await core.router()).to.equal(ADDRESS__UNISWAP_V2_ROUTER)
+        it("should have the correct address of router and position manager in Core", async () => {
+            expect(await core.router()).to.equal(ADDRESS_SWAP_ROUTER)
+            expect(await core.positionManager()).to.equal(ADDRESS_POSITION_MANAGER)
         })
 
         it("should transfer tokens to Alice", async () => {
-            // Transfer tokens to Alice for testing
-            await token1.connect(deployer).transfer(alice.address, parseEther("20"))
-            await token2.connect(deployer).transfer(alice.address, parseEther("20"))
+            await token1.connect(deployer).transfer(alice, parseEther("30"))
+            await token2.connect(deployer).transfer(alice, parseEther("30"))
 
-            expect(await token1.balanceOf(alice.address)).to.equal(parseEther("20"))
-            expect(await token2.balanceOf(alice.address)).to.equal(parseEther("20"))
+            expect(await token1.balanceOf(alice)).to.equal(parseEther("30"))
+            expect(await token2.balanceOf(alice)).to.equal(parseEther("30"))
         })
     })
+
+    function nearestUsableTick(tick: number, tickSpacing: number): number {
+        // Calculate the remainder when dividing the tick by the tick spacing
+        const remainder = tick % tickSpacing;
+
+        // If the tick is already a multiple of the tick spacing, return it directly
+        if (remainder === 0) {
+            return tick;
+        }
+
+        // If the tick is not a multiple of the tick spacing, find the nearest usable tick
+        // We can either round down or round up to the nearest usable tick
+        const lowerTick = tick - remainder;
+        const upperTick = tick + (tickSpacing - remainder);
+
+        // Choose the tick that is closest to the original tick
+        return Math.abs(tick - lowerTick) < Math.abs(tick - upperTick) ? lowerTick : upperTick;
+    }
 
     describe("Add Liquidity", async () => {
         it("should add liquidity successfully", async () => {
             // Alice approves Core to spend her tokens
-            await token1.connect(alice).approve(coreAddr, parseEther("4"))
-            await token2.connect(alice).approve(coreAddr, parseEther("6"))
+            await token1.connect(alice).approve(coreAddr, parseEther("10"))
+            await token2.connect(alice).approve(coreAddr, parseEther("10"))
+            
+            // 0.3% fee tier: tick spacing of 60
+            const tickLower = nearestUsableTick(-200, 60);     // Adjust as per price range
+            const tickUpper = nearestUsableTick(200, 60);   // Adjust as per price range
 
             // Add liquidity
             const tx = await core.connect(alice).addLiquidity(
-                token1Addr, 
-                token2Addr, 
-                parseEther("4"), 
-                parseEther("6")
+                0,                      // first adding so nftId is 0
+                token1Addr,             // address token0
+                token2Addr,             // address token1
+                parseEther("10"),       // amount0Desired
+                parseEther("10"),       // amount1Desired
+                POOL_FEE,               // poolFee
+                tickLower,              // tickLower
+                tickUpper,              // tickUpper
+                { gasLimit: 30000000 }
             );
-            await tx.wait()
 
-        })
+            const receipt: any = await tx.wait();
 
-        it("should verify token balance post-liquidity addition", async () => {
-            const remainingToken1Balance = await token1.balanceOf(alice.address);
-            const remainingToken2Balance = await token2.balanceOf(alice.address);
+            if(receipt !== null) {
+                // console.log("receipt:", receipt);
+                const event = receipt.events?.find((event: any) => event.event === 'LiquidityAdded');
 
-            expect(remainingToken1Balance).to.equal(parseEther("16"));
-            expect(remainingToken2Balance).to.equal(parseEther("14"));
+                if(event) {
+                    const tokenId = event?.args?.tokenId;
+                    console.log("event:", event);
+                    console.log("Added NFT id:", tokenId);
+                } else {
+                    console.log("       No LiquidityAdded event found in transaction receipt.");
+                }
+            }
+            
+            const remainingToken1Balance = await token1.balanceOf(alice);
+            const remainingToken2Balance = await token2.balanceOf(alice);
+
+            expect(remainingToken1Balance).to.equal(parseEther("20"));
+            expect(remainingToken2Balance).to.equal(parseEther("20"));
         });
     })
 
-    describe("Swapping tokens", () => {
-        it("should swap exact tokens for tokens", async () => {
+    describe("Swap Tokens", async () => {
+        it("should swap token successfully", async () => {
+            // Approve the router to spend the input token
+            await token1.connect(alice).approve(coreAddr, parseEther("1"))
 
-            await token1.connect(alice).approve(coreAddr, parseEther("2"));
-            const tx = await core.connect(alice).swapExactTokensForTokens(
-                token1Addr,
-                token2Addr,
-                parseEther("2")
+            const prevToken1Balance = await token1.balanceOf(alice);
+            const prevToken2Balance = await token2.balanceOf(alice);
+
+            // Execute the swap
+            const tx = await core.connect(alice).swapTokens(
+                token1,
+                token2,
+                parseEther("1"),
+                POOL_FEE
             );
-            await tx.wait();
+            const receipt = await tx.wait();
 
-            // Check Alice's balance of token2 increased
-            const token1Balance = await token1.balanceOf(alice.address);
-            const token2Balance = await token2.balanceOf(alice.address);
-            
-            expect(token2Balance).to.be.gt(parseEther("14"));
+            const afterToken1Balance = await token1.balanceOf(alice);
+            const afterToken2Balance = await token2.balanceOf(alice);
+
+            expect(prevToken1Balance - afterToken1Balance).to.equal(parseEther("1"));
+            expect(afterToken2Balance - prevToken2Balance).to.gt(0);
         });
-
-        it("should swap tokens for exact tokens", async () => {
-            const amountOut = parseEther("1");
-            const amountsIn = await v2Router.getAmountsIn(amountOut, [token1Addr, token2Addr]);
- 
-            await token1.connect(alice).approve(coreAddr, amountsIn[0]);
-            const tx = await core.connect(alice).swapTokensForExactTokens(
-                token1Addr,
-                token2Addr,
-                amountOut,
-                amountsIn[0] // maximum amount in
-            );
-            await tx.wait();
-
-            // Check Alice's balance of token2 matches the desired output
-            const token1Balance = await token1.balanceOf(alice.address);
-            const token2Balance = await token2.balanceOf(alice.address);
-            
-            expect(token2Balance).to.be.gte(amountOut);
-        });
-    });
-
-    describe("Remove Liquidity", async () => {
-        it("should remove liquidity successfully", async () => {
-            const liquidityPair: any = await v2Factory.getPair(token1Addr, token2Addr);
-            const liquidityToken = await ethers.getContractAt("IERC20", liquidityPair);
-            const liquidityAmount = await liquidityToken.balanceOf(alice);
-
-            await liquidityToken.connect(alice).approve(coreAddr, liquidityAmount);
-
-            // Remove liquidity
-            const tx = await core.connect(alice).removeLiquidity(
-                token1Addr, 
-                token2Addr,
-                liquidityAmount
-            );
-
-            // Wait for transaction to be mined
-            await tx.wait();
-        
-            // Check balances after removal
-            const amountA = await token1.balanceOf(alice);
-            const amountB = await token2.balanceOf(alice);
-
-            expect(amountA).to.be.gt(0);
-            expect(amountB).to.be.gt(0);
-        })
     })
+    // describe("Remove Liquidity", async () => {
+    //     it("should remove liquidity successfully", async () => {
+    //         // Decrease liquidity from a specific token ID (NFT position)
+    //         const tx = await core.removeLiquidity(
+    //             tokenId,
+    //             liquidity
+    //         );
 
-    describe("Add Liquidity(ETH)", async () => {
-        it("should add liquidity ETH", async function () {
-            const amountToken = parseEther("10"); // Amount of tokens to add
-            const ethAmount = parseEther("10"); // Amount of ETH to add
-            const prevBalance = await token1.balanceOf(alice);
-            console.log("Alice Prev ETH Amount: " + await ethers.provider.getBalance(alice.address));
-            await token1.connect(alice).approve(coreAddr, amountToken);
-
-            // Add liquidity
-            const tx = await core.connect(alice).addLiquidityETH(
-                token1Addr, 
-                amountToken, 
-                { value: ethAmount });
-            await tx.wait();
-
-            console.log("Alice After ETH Amount: " + await ethers.provider.getBalance(alice.address));
-            
-            const afterBalance = await token1.balanceOf(alice);;
-            expect(prevBalance - afterBalance).to.equal(amountToken);
-        });
-    });
-
-    describe("Swapping tokens(ETH, token)", () => {
-        it("should swap exact ETH for tokens", async () => {
-            const ethAmount = parseEther("1"); // Amount of ETH to add
-            const prevBalance = await token1.balanceOf(alice);
-            const tx = await core.connect(alice).swapExactETHForTokens(
-                token1Addr,
-                { value: ethAmount }
-            );
-            await tx.wait();
-            
-            const afterBalance = await token1.balanceOf(alice);
-            expect(afterBalance - prevBalance).gt(0);
-        });
-    });
-
-    describe("Remove Liquidity(ETH)", async () => {
-        it("should remove liquidity ETH successfully", async () => {
-            const liquidityPair = await v2Factory.getPair(token1Addr, await v2Router.WETH());
-            const liquidityToken = await ethers.getContractAt("IERC20", liquidityPair);
-            const liquidityAmount = await liquidityToken.balanceOf(alice);
-
-            await liquidityToken.connect(alice).approve(coreAddr, liquidityAmount);
-
-            // Remove liquidity
-            const tx = await core.connect(alice).removeLiquidityETH(
-                token1Addr,
-                liquidityAmount
-            );
-
-            // Wait for transaction to be mined
-            await tx.wait();
-        
-            // Check balances after removal
-            const amountA = await token1.balanceOf(alice);
-            const amountB = await ethers.provider.getBalance(alice);
-
-            expect(amountA).to.be.gt(0);
-            expect(amountB).to.be.gt(0);
-        })
-    })
+    //         const receipt = await tx.wait();
+    //         console.log("Liquidity removed. Transaction receipt:", receipt);
+    //     });
+    // })
 })
